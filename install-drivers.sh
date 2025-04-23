@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Exit on error and undefined variables
+set -euo pipefail
+
 # Check for root privileges
 if [ "$EUID" -ne 0 ]; then
   echo "----------------------------------------------------------"
@@ -12,6 +15,14 @@ echo "=========================================================="
 echo "                System Driver Installation                "
 echo "=========================================================="
 
+# Function for consistent error handling
+handle_error() {
+  echo "----------------------------------------------------------"
+  echo "ERROR: $1"
+  echo "----------------------------------------------------------"
+  exit 1
+}
+
 echo "Step 1: Detecting System Information..."
 # Detect Linux Distribution
 if command -v lsb_release >/dev/null 2>&1; then
@@ -20,130 +31,157 @@ elif [ -f /etc/os-release ]; then
   . /etc/os-release
   DISTRO=$ID
 else
-  echo "----------------------------------------------------------"
-  echo "ERROR: Unable to detect Linux distribution. Exiting..."
-  echo "----------------------------------------------------------"
-  exit 1
+  handle_error "Unable to detect Linux distribution"
 fi
 echo "Detected Distribution: $DISTRO"
 
-# Ensure lspci is available
 echo "Step 2: Checking for required tools..."
+# Install pciutils if missing
+install_pciutils() {
+  case $DISTRO in
+  "Ubuntu" | "Debian") apt update -y && apt install -y pciutils ;;
+  "Arch" | "Manjaro") pacman -Syu --noconfirm pciutils ;;
+  "Fedora") dnf update -y && dnf install -y pciutils ;;
+  "OpenSUSE") zypper refresh && zypper install -y pciutils ;;
+  *) handle_error "Unsupported distribution for pciutils install" ;;
+  esac
+}
+
 if ! command -v lspci >/dev/null 2>&1; then
   echo "pciutils package not found. Attempting to install..."
-  case $DISTRO in
-  "Ubuntu" | "Debian")
-    apt update -y && apt install -y pciutils
-    ;;
-  "Arch" | "Manjaro")
-    pacman -Syu --noconfirm pciutils
-    ;;
-  "Fedora")
-    dnf update -y && dnf install -y pciutils
-    ;;
-  "OpenSUSE")
-    zypper refresh && zypper install -y pciutils
-    ;;
-  *)
-    echo "----------------------------------------------------------"
-    echo "ERROR: Unsupported distribution. Please install pciutils manually."
-    echo "----------------------------------------------------------"
-    exit 1
-    ;;
-  esac
+  install_pciutils || handle_error "Failed to install pciutils"
 fi
 
 echo "Step 3: Detecting GPU..."
-# Detect GPU
-if lspci | grep -i nvidia >/dev/null 2>&1; then
-  GPU="NVIDIA"
-elif lspci | grep -i amd >/dev/null 2>&1; then
-  GPU="AMD"
-elif lspci | grep -i "Intel Corporation" | grep -i "VGA" >/dev/null 2>&1; then
-  GPU="Intel"
+GPU_DETECTED=""
+if lspci | grep -qi "nvidia"; then
+  GPU_DETECTED="NVIDIA"
+elif lspci | grep -qi "amd"; then
+  GPU_DETECTED="AMD"
+elif lspci | grep -qi "intel.*vga"; then
+  GPU_DETECTED="Intel"
 else
-  GPU="VESA"
-  echo "WARNING: GPU not detected. Defaulting to generic drivers."
+  GPU_DETECTED="Generic"
+  echo "WARNING: Specific GPU not detected, using generic drivers"
 fi
-echo "Detected GPU: $GPU"
+echo "Detected GPU: $GPU_DETECTED"
 
 echo "=========================================================="
 echo "                Installing Appropriate Drivers            "
 echo "=========================================================="
+
+# Common driver packages
+install_common() {
+  case $DISTRO in
+  "Ubuntu" | "Debian")
+    apt install -y mesa-utils libgl1-mesa-dri libgles2-mesa mesa-vulkan-drivers vulkan-tools
+    ;;
+  "Arch" | "Manjaro")
+    pacman -S --noconfirm mesa mesa-utils vulkan-tools vulkan-icd-loader
+    ;;
+  "Fedora")
+    dnf install -y mesa-dri-drivers mesa-libGL mesa-vulkan-drivers
+    ;;
+  "OpenSUSE")
+    zypper install -y Mesa-dri Mesa-utils vulkan-tools
+    ;;
+  esac
+}
+
+# GPU-specific installation
 case $DISTRO in
 "Ubuntu" | "Debian")
-  echo "Updating package lists..."
-  apt update -y
-  echo "Installing essential driver packages..."
-  apt install -y mesa-utils libgl1-mesa-dri libgles2-mesa vulkan-tools
-  if [ "$GPU" == "NVIDIA" ]; then
+  apt update -y || handle_error "Failed to update packages"
+  install_common
+  case $GPU_DETECTED in
+  "NVIDIA")
     echo "Installing NVIDIA drivers..."
-    apt install -y nvidia-driver nvidia-utils
-  elif [ "$GPU" == "AMD" ]; then
+    apt install -y nvidia-driver nvidia-utils nvidia-vulkan-common
+    ;;
+  "AMD")
     echo "Installing AMD drivers..."
     apt install -y firmware-amd-graphics mesa-opencl-icd
-  elif [ "$GPU" == "Intel" ]; then
-    echo "Installing Intel drivers..."
-    apt install -y xserver-xorg-video-intel
-  fi
+    ;;
+  "Intel")
+    echo "Intel integrated graphics detected (using default Mesa drivers)"
+    ;;
+  esac
   ;;
+
 "Arch" | "Manjaro")
-  echo "Updating system packages..."
-  pacman -Syu --noconfirm
-  echo "Installing essential driver packages..."
-  pacman -S --noconfirm mesa mesa-utils vulkan-tools
-  if [ "$GPU" == "NVIDIA" ]; then
+  pacman -Syu --noconfirm || handle_error "Failed to update packages"
+  install_common
+  case $GPU_DETECTED in
+  "NVIDIA")
     echo "Installing NVIDIA drivers..."
-    pacman -S --noconfirm nvidia nvidia-utils
-  elif [ "$GPU" == "AMD" ]; then
+    pacman -S --noconfirm nvidia nvidia-utils nvidia-settings
+    ;;
+  "AMD")
     echo "Installing AMD drivers..."
-    pacman -S --noconfirm xf86-video-amdgpu
-  elif [ "$GPU" == "Intel" ]; then
+    pacman -S --noconfirm xf86-video-amdgpu vulkan-radeon
+    ;;
+  "Intel")
     echo "Installing Intel drivers..."
-    pacman -S --noconfirm xf86-video-intel
-  fi
+    pacman -S --noconfirm vulkan-intel
+    ;;
+  esac
   ;;
+
 "Fedora")
-  echo "Updating system packages..."
-  dnf update -y
-  echo "Installing essential driver packages..."
-  dnf install -y mesa-dri-drivers mesa-libGL
-  if [ "$GPU" == "NVIDIA" ]; then
+  dnf update -y || handle_error "Failed to update packages"
+  install_common
+  case $GPU_DETECTED in
+  "NVIDIA")
+    echo "Checking for RPM Fusion..."
+    if ! dnf repolist | grep -q rpmfusion; then
+      handle_error "RPM Fusion required for NVIDIA drivers. See: https://rpmfusion.org/Configuration"
+    fi
     echo "Installing NVIDIA drivers..."
-    dnf install -y akmod-nvidia
-  elif [ "$GPU" == "AMD" ]; then
+    dnf install -y akmod-nvidia nvidia-vulkan-common
+    ;;
+  "AMD")
     echo "Installing AMD drivers..."
-    dnf install -y mesa-dri-drivers
-  elif [ "$GPU" == "Intel" ]; then
+    dnf install -y mesa-va-drivers mesa-vdpau-drivers
+    ;;
+  "Intel")
     echo "Installing Intel drivers..."
-    dnf install -y xorg-x11-drv-intel
-  fi
+    dnf install -y intel-media-driver
+    ;;
+  esac
   ;;
+
 "OpenSUSE")
-  echo "Refreshing repositories..."
-  zypper refresh
-  echo "Installing essential driver packages..."
-  zypper install -y Mesa-dri Mesa-utils
-  if [ "$GPU" == "NVIDIA" ]; then
+  zypper refresh || handle_error "Failed to refresh repositories"
+  install_common
+  case $GPU_DETECTED in
+  "NVIDIA")
+    echo "Adding NVIDIA repository..."
+    zypper --non-interactive addrepo -f https://download.nvidia.com/opensuse/tumbleweed NVIDIA
+    zypper --gpg-auto-import-keys refresh
     echo "Installing NVIDIA drivers..."
-    zypper install -y x11-video-nvidiaG05
-  elif [ "$GPU" == "AMD" ]; then
+    zypper install -y nvidia-video-G05 nvidia-vulkan-common
+    ;;
+  "AMD")
     echo "Installing AMD drivers..."
-    zypper install -y Mesa-dri Mesa-utils
-  elif [ "$GPU" == "Intel" ]; then
+    zypper install -y Mesa-dri Mesa-utils vulkan-radeon
+    ;;
+  "Intel")
     echo "Installing Intel drivers..."
-    zypper install -y xf86-video-intel
-  fi
+    zypper install -y vulkan-intel
+    ;;
+  esac
   ;;
+
 *)
-  echo "----------------------------------------------------------"
-  echo "ERROR: Unsupported distribution. Install drivers manually."
-  echo "----------------------------------------------------------"
-  exit 1
+  handle_error "Unsupported distribution: $DISTRO"
   ;;
 esac
 
 echo "=========================================================="
 echo "            Driver Installation Completed                 "
 echo "=========================================================="
-echo "Please reboot your system to apply the changes."
+echo -e "\nPost-installation notes:"
+[ "$GPU_DETECTED" = "NVIDIA" ] && echo "* NVIDIA: Check Secure Boot configuration if enabled"
+[ "$GPU_DETECTED" = "Intel" ] && echo "* Intel: Hardware video acceleration may require additional configuration"
+echo -e "\nPlease reboot your system to apply changes\n"
+
